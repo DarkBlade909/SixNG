@@ -573,8 +573,14 @@ pub fn write_png(store: &Ttpf, t: &TtpfTex, dir: &Path) -> Result<(PathBuf, PngS
     let js = dir.join(format!("{:016x}.json", t.hash));
     if p.exists() {
         // stats written before alpha_range existed are refreshed below, and so
-        // are lower-mip PNGs whose top mips now decode (BC1 BCPack)
-        if let Some(st) = std::fs::read(&js).ok().and_then(|b| serde_json::from_slice::<PngStats>(&b).ok()).filter(|st| st.alpha_range.is_some() && !matches!(store.best_mip(t), Some(m) if m < st.mip) && (t.mips_fixed.is_none() || st.mips == Some(t.mips()))) {
+        // are lower-mip PNGs whose top mips now decode (BC1 BCPack) or old BC5
+        // PNGs written before tangent-space Z reconstruction (mean B = 0).
+        if let Some(st) = std::fs::read(&js).ok().and_then(|b| serde_json::from_slice::<PngStats>(&b).ok()).filter(|st| {
+            st.alpha_range.is_some()
+                && !matches!(store.best_mip(t), Some(m) if m < st.mip)
+                && (t.mips_fixed.is_none() || st.mips == Some(t.mips()))
+                && !(crate::texture::Fmt::from_dxgi(t.dxgi_format) == crate::texture::Fmt::Bc5 && st.mean_rgba[2] < 1.0)
+        }) {
             return Ok((p, st));
         }
     }

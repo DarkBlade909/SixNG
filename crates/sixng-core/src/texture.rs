@@ -483,7 +483,13 @@ pub fn to_rgba(fmt: Fmt, data: &[u8], w: u32, h: u32) -> Result<Vec<u8>> {
             r
         }
         Fmt::Bc4 => td::decode_bc4(data, wu, hu, &mut img),
-        Fmt::Bc5 => td::decode_bc5(data, wu, hu, &mut img),
+        Fmt::Bc5 => {
+            let r = td::decode_bc5(data, wu, hu, &mut img);
+            if r.is_ok() {
+                reconstruct_bc5_z(&mut img);
+            }
+            r
+        }
         Fmt::Bc6u => crate::bc6h::decode_image(data, wu, hu, &mut img, false),
         Fmt::Bc6s => crate::bc6h::decode_image(data, wu, hu, &mut img, true),
         Fmt::Bc7 => td::decode_bc7(data, wu, hu, &mut img),
@@ -534,6 +540,20 @@ pub fn to_rgba(fmt: Fmt, data: &[u8], w: u32, h: u32) -> Result<Vec<u8>> {
         out.extend_from_slice(&[(px >> 16) as u8, (px >> 8) as u8, px as u8, (px >> 24) as u8]);
     }
     Ok(out)
+}
+
+/// Reconstruct the tangent-space Z component into the blue channel of a decoded
+/// BC5 image (`0xAARRGGBB`). `texture2ddecoder::decode_bc5` leaves B = 0, which
+/// unpacks as z = -1 in glTF viewers and prevents `normal_like` detection.
+/// R and G (DirectX green) are kept untouched so shaders that flip G stay consistent.
+fn reconstruct_bc5_z(img: &mut [u32]) {
+    for px in img.iter_mut() {
+        let r = ((*px >> 16) & 0xFF) as f32 * (2.0 / 255.0) - 1.0;
+        let g = ((*px >> 8) & 0xFF) as f32 * (2.0 / 255.0) - 1.0;
+        let z = (1.0 - r * r - g * g).max(0.0).sqrt();
+        let b = ((z * 0.5 + 0.5).clamp(0.0, 1.0) * 255.0 + 0.5) as u32;
+        *px = (*px & 0xFFFF_FF00) | b;
+    }
 }
 
 pub fn save_png(path: &Path, rgba: &[u8], w: u32, h: u32) -> Result<()> {
@@ -775,6 +795,27 @@ mod bc_colour_tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn bc5_reconstructs_normal_z() {
+        // One 4x4 BC5 block: R = 128, G = 128 everywhere (flat normal -> Z ≈ +1, B = 255).
+        let mut flat = [0u8; 16];
+        flat[0] = 128;
+        flat[1] = 128;
+        flat[8] = 128;
+        flat[9] = 128;
+        let rgba = to_rgba(Fmt::Bc5, &flat, 4, 4).unwrap();
+        assert_eq!(px(&rgba, 0), [128, 128, 255, 255]);
+
+        // Tilted normal: R = 255 (x = +1), G = 128 (y ≈ 0) -> z = 0 -> B = 128.
+        let mut tilted = [0u8; 16];
+        tilted[0] = 255;
+        tilted[1] = 255;
+        tilted[8] = 128;
+        tilted[9] = 128;
+        let rgba = to_rgba(Fmt::Bc5, &tilted, 4, 4).unwrap();
+        assert_eq!(px(&rgba, 0), [255, 128, 128, 255]);
     }
 }
 
