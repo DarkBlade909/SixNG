@@ -142,10 +142,59 @@ pub fn prefixes<'a>(names: impl Iterator<Item = &'a str>) -> HashMap<u32, (Strin
     m
 }
 
+/// Three-character ped body-class token in a drawable name (e.g. `fr1`, `mr1`,
+/// `fc1`, `mb1`, `mk1`, `mi1`).
+fn body_class(name: &str) -> Option<&str> {
+    name.split('_').find(|t| {
+        let b = t.as_bytes();
+        b.len() == 3 && matches!(b[0], b'f' | b'm') && matches!(b[1], b'r' | b'b' | b'o' | b'c' | b'k' | b'i' | b'0') && b[2].is_ascii_digit()
+    })
+}
+
 /// The drawable that uses most of an item's textures (`_full` before cull
 /// and LOD copies, then by name).
 pub fn pick(counts: &BTreeMap<String, usize>) -> Option<String> {
-    counts.iter().max_by(|a, b| a.1.cmp(b.1).then(b.0.ends_with("_full").cmp(&a.0.ends_with("_full")).reverse()).then(b.0.cmp(a.0))).map(|(n, _)| n.clone())
+    pick_for(counts, None, None)
+}
+
+/// Pick the best drawable for an item, preferring an explicit tag name when
+/// present, and breaking texture-count ties by head prefix (for eyes/eyecaps),
+/// ped body class (`fr1`, `mr1`, …), `_full`, then name.
+pub fn pick_for(counts: &BTreeMap<String, usize>, ped_class: Option<&str>, head_prefix: Option<&str>) -> Option<String> {
+    counts
+        .iter()
+        .max_by(|a, b| {
+            let hp = |n: &str| head_prefix.is_some_and(|p| n.starts_with(p));
+            let bc = |n: &str| ped_class.is_some_and(|c| body_class(n) == Some(c));
+            a.1.cmp(b.1)
+                .then(hp(a.0).cmp(&hp(b.0)))
+                .then(bc(a.0).cmp(&bc(b.0)))
+                .then(a.0.ends_with("_full").cmp(&b.0.ends_with("_full")))
+                .then(b.0.cmp(a.0))
+        })
+        .map(|(n, _)| n.clone())
+}
+
+fn pick_with_name(counts: &BTreeMap<String, usize>, name: Option<&(String, String)>, ped_class: Option<&str>, head_prefix: Option<&str>) -> Option<String> {
+    if let Some((prefix, fallback)) = name {
+        let matched: BTreeMap<String, usize> = counts.iter().filter(|(k, _)| k.starts_with(prefix.as_str())).map(|(k, &v)| (k.clone(), v)).collect();
+        return pick_for(&matched, ped_class, head_prefix).or_else(|| Some(fallback.clone()));
+    }
+    pick_for(counts, ped_class, head_prefix)
+}
+
+fn item_chain<'a>(it: &'a Value, items: &'a HashMap<u64, Value>) -> Vec<&'a Value> {
+    let f = crate::meta7a::field_name;
+    let mut chain = vec![it];
+    while chain.len() < 8 {
+        let last = chain[chain.len() - 1];
+        let next = [0x080e_ec39u32, 0xe13e_baf8].iter().filter_map(|&k| last[f(k)].as_u64()).filter(|&x| x != 0).filter_map(|x| items.get(&x)).find(|n| !chain.iter().any(|c| std::ptr::eq(*c, *n)));
+        match next {
+            Some(n) => chain.push(n),
+            None => break,
+        }
+    }
+    chain
 }
 
 fn hashes64(v: &Value, out: &mut Vec<u64>) {
@@ -176,20 +225,41 @@ pub fn variations(m: &Meta, pre: &HashMap<u32, (String, String)>, tu: &TexUsers,
             }
         }
     }
-    let mut out = Vec::new();
-    for v in get(0xa9d5_7751) {
-        let mut parts = Vec::new();
-        for ln in v[f(0xfb5b_b20d)].as_array().into_iter().flatten() {
-            let Some(it) = ln[f(0x6512_1749)].as_u64().and_then(|i| items.get(&i)) else { continue };
-            let mut chain = vec![it];
-            while chain.len() < 8 {
-                let last = chain[chain.len() - 1];
-                let next = [0x080e_ec39u32, 0xe13e_baf8].iter().filter_map(|&k| last[f(k)].as_u64()).filter(|&x| x != 0).filter_map(|x| items.get(&x)).find(|n| !chain.iter().any(|c| std::ptr::eq(*c, *n)));
-                match next {
-                    Some(n) => chain.push(n),
-                    None => break,
+    // Infer the ped's body class (e.g. `fr1`, `mr1`) from any tag-resolved item
+    // names in this resource, so texture-only ties on shared skin/clothing maps
+    // stay on the right body class.
+    let mut class_counts: BTreeMap<&str, usize> = BTreeMap::new();
+    for it in items.values() {
+        for &k in &[0x4bfd_27ddu32, 0x023e_5a2f, 0x2a8c_db1d] {
+            for x in tags(it, k) {
+                if let Some(p) = pre.get(&x).filter(|p| p.0.contains('_')) {
+                    if let Some(bc) = body_class(&p.0) {
+                        *class_counts.entry(bc).or_insert(0) += 1;
+                    }
                 }
             }
+        }
+    }
+    let ped_class: Option<String> = class_counts.into_iter().max_by_key(|&(_, n)| n).map(|(c, _)| c.to_string());
+
+    let mut out = Vec::new();
+    for v in get(0xa9d5_7751) {
+        let links: Vec<&Value> = v[f(0xfb5b_b20d)].as_array().into_iter().flatten().filter_map(|ln| ln[f(0x6512_1749)].as_u64().and_then(|i| items.get(&i))).collect();
+        // If this variation is a head set, capture the head's stem (walking
+        // parent chains) so eyes / eyecaps / lashes tie-break to the same head
+        // rather than alphabetically.
+        let head_prefix: Option<String> = links.iter().find_map(|it| {
+            item_chain(it, &items).into_iter().find_map(|c| {
+                tags(c, 0x4bfd_27dd).into_iter().find_map(|x| {
+                    let p = pre.get(&x)?;
+                    let stem = p.0.strip_suffix("_full").unwrap_or(&p.0);
+                    Some(format!("{stem}_"))
+                })
+            })
+        });
+        let mut parts = Vec::new();
+        for it in links {
+            let chain = item_chain(it, &items);
             let mut tex = Vec::new();
             chain.iter().for_each(|c| hashes64(c, &mut tex));
             let mut counts: BTreeMap<String, usize> = BTreeMap::new();
@@ -206,7 +276,7 @@ pub fn variations(m: &Meta, pre: &HashMap<u32, (String, String)>, tu: &TexUsers,
             }
             let name = chain.iter().find_map(|c| [0x4bfd_27ddu32, 0x023e_5a2f, 0x2a8c_db1d].iter().flat_map(|&k| tags(c, k)).find_map(|x| pre.get(&x).filter(|p| p.0.contains('_'))));
             let category = chain.iter().find_map(|c| c["Category"].as_u64().filter(|&x| x != 0)).map(|h| crate::names::lookup(h as u32, crate::names::Ctx::Field).filter(|n| !n.is_empty()).unwrap_or_else(|| format!("{h:08x}")));
-            let drawable = pick(&counts).or_else(|| name.map(|p| p.1.clone()));
+            let drawable = pick_with_name(&counts, name, ped_class.as_deref(), head_prefix.as_deref());
             let mut tex_remap = Vec::new();
             if let Some(mats) = drawable.as_deref().and_then(|d| model_mats.get(d)) {
                 for (slot, new) in set_textures(&chain) {
@@ -248,6 +318,26 @@ mod tests {
     fn pick_prefers_most_textures_then_full() {
         let c = [("top_fr1_000_cull_00".to_string(), 3), ("top_fr1_000_full".to_string(), 3), ("brows_mi1_000_full".to_string(), 1)].into_iter().collect();
         assert_eq!(super::pick(&c).as_deref(), Some("top_fr1_000_full"));
+    }
+
+    #[test]
+    fn pick_for_breaks_ties_by_head_prefix_and_body_class() {
+        let body = [("hand_fc1_000_full".to_string(), 2), ("hand_fr1_000_full".to_string(), 2)].into_iter().collect();
+        assert_eq!(super::pick_for(&body, Some("fr1"), None).as_deref(), Some("hand_fr1_000_full"));
+
+        let eyes = [("cs_a_head_fr1_000_eyes_full".to_string(), 2), ("head_fr1_001_y_eyes_full".to_string(), 2)].into_iter().collect();
+        assert_eq!(super::pick_for(&eyes, Some("fr1"), Some("head_fr1_001_y_")).as_deref(), Some("head_fr1_001_y_eyes_full"));
+    }
+
+    #[test]
+    fn pick_with_name_prefers_tag_prefix_over_shared_dummy_texture() {
+        let dummy = [("brows_mi1_000_full".to_string(), 1), ("hair_fr1_000_full".to_string(), 1)].into_iter().collect();
+        let tag = ("hair_fr1_000".to_string(), "hair_fr1_000_full".to_string());
+        assert_eq!(super::pick_with_name(&dummy, Some(&tag), Some("fr1"), None).as_deref(), Some("hair_fr1_000_full"));
+
+        let tied = [("top_fr1_027_slim_full".to_string(), 2), ("top_fr1_028_slim_full".to_string(), 2)].into_iter().collect();
+        let tag28 = ("top_fr1_028".to_string(), "top_fr1_028_slim_full".to_string());
+        assert_eq!(super::pick_with_name(&tied, Some(&tag28), Some("fr1"), None).as_deref(), Some("top_fr1_028_slim_full"));
     }
 
     #[test]
