@@ -147,6 +147,10 @@ pub struct PartFx {
     /// A garment that covers skin (top, jacket, trousers, dress, shoes,
     /// gloves): skin right under it is hidden.
     pub covers: bool,
+    /// Clothing layer: 1 = worn under a jacket or coat (top, bottom, one
+    /// piece), 2 = the jacket or coat. Layer 1 is hidden where layer 2
+    /// covers it.
+    pub layer: u8,
     /// A shoe with a heel (name token `sh`, `mh` or `hh`; flat ones have
     /// `fh`): the feet are posed into it.
     pub heel: bool,
@@ -3287,6 +3291,8 @@ fn load_parts(
     let mut skin_meshes: Vec<std::ops::Range<usize>> = Vec::new();
     let mut cover_meshes: Vec<std::ops::Range<usize>> = Vec::new();
     let mut heel_meshes: Vec<std::ops::Range<usize>> = Vec::new();
+    let mut under_meshes: Vec<std::ops::Range<usize>> = Vec::new();
+    let mut outer_meshes: Vec<std::ops::Range<usize>> = Vec::new();
     // Body shape: the skin and head are posed by the game's rig; clothes
     // and accessories follow the skin under them (`Wrap`).
     let shape = if fx.is_empty() { (0.0, 0.0) } else { *BODY_SHAPE.lock().unwrap() };
@@ -3368,6 +3374,11 @@ fn load_parts(
                 if f.is_some_and(|f| f.covers) {
                     cover_meshes.push(mesh0..mesh0 + m.meshes.len());
                 }
+                match f.map_or(0, |f| f.layer) {
+                    1 => under_meshes.push(mesh0..mesh0 + m.meshes.len()),
+                    2 => outer_meshes.push(mesh0..mesh0 + m.meshes.len()),
+                    _ => {}
+                }
                 if f.is_some_and(|f| f.heel) {
                     heel_meshes.push(mesh0..mesh0 + m.meshes.len());
                 }
@@ -3411,6 +3422,12 @@ fn load_parts(
         let hidden = hide_covered_skin(m, &skin_meshes, &cover_meshes);
         if hidden > 0 {
             notes.push(format!("Skin under clothes: {hidden} skin triangles that lie right under a garment are hidden, so skin does not show through it. (The game uses skin meshes cut to the garment; which cut goes with which garment is not decoded.)"));
+        }
+    }
+    if let (Some(m), false, false) = (&mut model, under_meshes.is_empty(), outer_meshes.is_empty()) {
+        let hidden = hide_covered_skin(m, &under_meshes, &outer_meshes);
+        if hidden > 0 {
+            notes.push(format!("Layers: {hidden} triangles of the clothes worn under the jacket are hidden where the jacket covers them, so they do not show through it."));
         }
     }
     if coloured > 0 {
@@ -4091,6 +4108,7 @@ fn load_query_sel(
                 }));
                 opts.iter_mut().for_each(|o| o.default = false);
                 let mut info = LookInfo { model: look.model.clone(), labels: look.outfits.iter().map(|o| o.label.clone()).collect(), current: k, ..Default::default() };
+                info.notes.extend(look.note.clone());
                 for (oi, o) in look.outfits.iter().enumerate() {
                     for p in &o.parts {
                         if p.strands {
@@ -4112,17 +4130,18 @@ fn load_query_sel(
                         }
                         if oi == k {
                             let body = p.slot == "body upper" || p.slot == "body lower";
-                            fx.insert(e.off, PartFx { tint: p.tint.as_ref().and_then(|t| Some((u32::from_str_radix(&t.palette, 16).ok()?, t.rows[0]))).filter(|t| t.1 != 255), colour: p.colour.map(|c| [c[1], c[2], c[3]]), tag: p.colour_tag, head: p.slot == "head", body, skeletal: body || matches!(p.slot.as_str(), "head" | "eyes" | "teeth" | "teeth accessory"), covers: matches!(p.slot.as_str(), "top" | "outer" | "bottom" | "full" | "feet" | "gloves"), heel: p.slot == "feet" && p.drawable.split('_').any(|t| matches!(t, "sh" | "mh" | "hh")), skins: if p.slot == "head" { p.skins.iter().filter_map(|(a, n)| Some((u64::from_str_radix(a, 16).ok()?, u64::from_str_radix(n, 16).unwrap_or(0)))).collect() } else { Vec::new() } });
+                            fx.insert(e.off, PartFx { tint: p.tint.as_ref().and_then(|t| Some((u32::from_str_radix(&t.palette, 16).ok()?, t.rows[0]))).filter(|t| t.1 != 255), colour: p.colour.map(|c| [c[1], c[2], c[3]]), tag: p.colour_tag, head: p.slot == "head", body, skeletal: body || matches!(p.slot.as_str(), "head" | "eyes" | "teeth" | "teeth accessory"), covers: matches!(p.slot.as_str(), "top" | "outer" | "bottom" | "full" | "feet" | "gloves"), layer: match p.slot.as_str() { "outer" => 2, "top" | "bottom" | "full" => 1, _ => 0 }, heel: p.slot == "feet" && p.drawable.split('_').any(|t| matches!(t, "sh" | "mh" | "hh")), skins: if p.slot == "head" { p.skins.iter().filter_map(|(a, n)| Some((u64::from_str_radix(a, 16).ok()?, u64::from_str_radix(n, 16).unwrap_or(0)))).collect() } else { Vec::new() } });
                         }
                     }
                 }
                 // strand hair: the grooms placed for each hair asset
                 match sixng_core::hairlink::get(&ws.work, &a, &ix.entries) {
                     Ok(t) => {
-                        for (slot, _, guid) in &info.strands {
-                            let Some(l) = u64::from_str_radix(guid, 16).ok().and_then(|g| t.resolve(g, look.fit.as_deref())) else { continue };
+                        for (slot, placeholder, guid) in &info.strands {
+                            // by the item's hair asset, else by the character's own placeholder
+                            let Some(l) = u64::from_str_radix(guid, 16).ok().and_then(|g| t.resolve(g, look.fit.as_deref())).or_else(|| guid.is_empty().then(|| t.by_placeholder(placeholder)).flatten()) else { continue };
                             let colour = info.strand_tints.iter().find(|t| t.0 == *slot && t.1 == 0x1e64_f584).and_then(|t| Some(sixng_core::pedtint::palettes(&ws.game).ok()?.get(&t.1)?.sample(t.2, 128)));
-                            info.hair.push(HairPick { slot: slot.clone(), placeholder: l.placeholder.clone(), confidence: l.confidence, grooms: t.uncontested(l), off_head: 0, shown: l.confidence >= 0.5, colour });
+                            info.hair.push(HairPick { slot: slot.clone(), placeholder: l.placeholder.clone(), confidence: l.confidence, grooms: t.uncontested(l), off_head: 0, shown: l.confidence >= 0.5 && slot != "body hair", colour });
                         }
                     }
                     Err(e) => info.notes.push(format!("Strand hair: {e}")),
@@ -4154,9 +4173,14 @@ fn load_query_sel(
             if *BODY_SHAPE.lock().unwrap() == (0.0, 0.0) && !l.hair.is_empty() {
                 const CELL: f32 = 0.012;
                 let key = |p: &[f32; 3]| ((p[0] / CELL).floor() as i32, (p[1] / CELL).floor() as i32, (p[2] / CELL).floor() as i32);
-                let cells: std::collections::HashSet<(i32, i32, i32)> = skin.iter().filter(|(n, _)| n.contains("_head_") || n.starts_with("head_") || n.starts_with("hand_") || n.starts_with("feet_")).flat_map(|(_, pts)| pts.iter().map(key)).collect();
-                if !cells.is_empty() {
+                // hair, brows, beards and lashes must root on the head; body
+                // hair on the head or the body
+                let is_head = |n: &str| n.contains("_head_") || n.starts_with("head_");
+                let head_cells: std::collections::HashSet<(i32, i32, i32)> = skin.iter().filter(|(n, _)| is_head(n)).flat_map(|(_, pts)| pts.iter().map(key)).collect();
+                let all_cells: std::collections::HashSet<(i32, i32, i32)> = skin.iter().filter(|(n, _)| is_head(n) || n.starts_with("hand_") || n.starts_with("feet_")).flat_map(|(_, pts)| pts.iter().map(key)).collect();
+                if !head_cells.is_empty() {
                     for h in &mut l.hair {
+                        let cells = if h.slot == "body hair" { &all_cells } else { &head_cells };
                         let all = h.grooms.len();
                         h.grooms.retain(|&off| {
                             let Ok(g) = sixng_core::groom::load(&a, &ix.entries, off) else { return true };
@@ -4169,7 +4193,9 @@ fn load_query_sel(
                             on * 10 >= n * 8
                         });
                         h.off_head = all - h.grooms.len();
-                        h.shown = !h.grooms.is_empty() && (h.confidence >= 0.5 || (h.confidence >= 0.2 && h.off_head == 0));
+                        // body hair is fine fuzz in the game; drawn at hair
+                        // width it reads as fur, so it is offered but starts off
+                        h.shown = h.slot != "body hair" && !h.grooms.is_empty() && (h.confidence >= 0.5 || (h.confidence >= 0.2 && h.off_head == 0));
                     }
                 }
             }
