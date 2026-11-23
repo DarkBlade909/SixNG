@@ -38,6 +38,7 @@ mod model_picker;
 mod model_view;
 mod pages;
 mod render3d;
+mod siren_sound;
 #[cfg(all(target_os = "macos", feature = "metal4-poc"))]
 mod render3d_metal4;
 mod texture_view;
@@ -1633,6 +1634,7 @@ impl App {
         m.cfg_request = c.u("config").map(|v| v as usize);
         m.brake_heat = c.f("brake-glow").unwrap_or(0.0);
         m.windows_down = c.f("windows").unwrap_or(0.0);
+        m.siren = c.f("siren").unwrap_or(0.0) as usize;
         m.lamps = c.get("lights").map(model_view::Lamps::parse).unwrap_or_default();
         m.boot_open = c.f("boot").unwrap_or(0.0);
         if let Some(v) = c.f("yaw") {
