@@ -176,6 +176,9 @@ pub struct LookInfo {
     pub notes: Vec<String>,
     /// Strand hair found for the outfit's hair assets (`hairlink`).
     pub hair: Vec<HairPick>,
+    /// The colours of the game's hair palette (`ped_tint_hair`, each row at
+    /// mid shade, sRGB), to pick from.
+    pub hair_swatches: Vec<[u8; 3]>,
 }
 
 /// The grooms of one hair asset of an outfit.
@@ -251,6 +254,9 @@ pub struct Automation {
     /// `--find-hair`: fit grooms to the model and show the run with the
     /// most strands (tests "Find grooms on this model").
     pub find_hair: bool,
+    /// `--hair-style TEXT`: also show the character's hair entries whose
+    /// placeholder name contains this.
+    pub hair_style: Option<String>,
     /// `--hair-width MM` for a character's own hair.
     pub hair_width: Option<f32>,
 }
@@ -1354,6 +1360,18 @@ impl ModelView {
                 ui.color_edit_button_rgb(&mut self.hair.colour);
                 ui.label(egui::RichText::new("(stored for items that name the hair palette; most leave it to the game, so pick one)").weak().small());
             });
+            if !look.hair_swatches.is_empty() {
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing = egui::vec2(2.0, 2.0);
+                    for c in look.hair_swatches.iter().take(64) {
+                        let (r, resp) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::click());
+                        ui.painter().rect_filled(r, 2.0, egui::Color32::from_rgb(c[0], c[1], c[2]));
+                        if resp.on_hover_text("A colour of the game's hair palette (ped_tint_hair)").clicked() {
+                            self.hair.colour = c.map(|x| x as f32 / 255.0);
+                        }
+                    }
+                });
+            }
         }
         let unplaced: Vec<&str> = look.strands.iter().filter(|s| !look.hair.iter().any(|h| h.slot == s.0)).map(|s| s.1.as_str()).collect();
         if !unplaced.is_empty() {
@@ -1584,7 +1602,8 @@ impl ModelView {
                     let key = format!("{}#{}", look.model, look.current);
                     if self.hair.look_key != key {
                         self.hair.look_key = key;
-                        self.hair.selected = look.hair.iter().filter(|h| h.shown).flat_map(|h| h.grooms.iter().copied()).collect();
+                        let want = self.auto.hair_style.clone();
+                        self.hair.selected = look.hair.iter().filter(|h| h.shown || want.as_ref().is_some_and(|w| h.placeholder.contains(w.as_str()))).flat_map(|h| h.grooms.iter().copied()).collect();
                         if let Some(c) = look.hair.iter().find(|h| h.slot == "hair").or(look.hair.first()).and_then(|h| h.colour) {
                             self.hair.colour = c.map(|x| x as f32 / 255.0);
                         }
@@ -3875,8 +3894,8 @@ fn colour_part(m: &mut glb::Model, f: &PartFx, game: &Path) -> bool {
     let generic = f.tint.is_some_and(|t| t.0 == 0xa7c8_d8e0);
     let pal = pal.filter(|(p, row)| !generic || f.tag.is_none_or(|t| sixng_core::pedtint::nearest_word(p.sample(*row, 128)) == t));
     let word = f.tag.and_then(|t| sixng_core::pedtint::COLOUR_WORDS.iter().find(|w| w.0 == t)).map(|w| w.1);
-    // shade maps are mid grey on plain cloth: 190 keeps the colour there
-    let flat = |c: [u8; 3]| -> [[u8; 3]; 256] { std::array::from_fn(|v| c.map(|x| ((x as f32) * (v as f32 / 190.0)).min(255.0) as u8)) };
+    // the fabric shade is mid grey (about 125) on plain cloth: the colour is kept there
+    let flat = |c: [u8; 3]| -> [[u8; 3]; 256] { std::array::from_fn(|v| c.map(|x| ((x as f32) * (v as f32 / 125.0)).min(255.0) as u8)) };
     let lut: [[u8; 3]; 256] = match (f.colour, pal, word) {
         (Some(c), _, _) => flat(c),
         (None, Some((p, row)), _) => std::array::from_fn(|v| p.sample(row, v as u8)),
@@ -4692,6 +4711,16 @@ fn load_query_sel(
                         }
                     }
                 }
+                if let Some(p) = sixng_core::pedtint::palettes(&ws.game).ok().and_then(|ps| ps.get(&0x1e64_f584)) {
+                    for row in 0..p.h.min(256) {
+                        let c = p.sample(row as u8, 128);
+                        // rows repeat and the unused ones are black or white
+                        let dull = c.iter().all(|x| *x < 6) || c.iter().all(|x| *x > 250);
+                        if !dull && !info.hair_swatches.iter().any(|s| (0..3).all(|k| (s[k] as i32 - c[k] as i32).abs() < 6)) {
+                            info.hair_swatches.push(c);
+                        }
+                    }
+                }
                 // strand hair: the grooms placed for each hair asset
                 match sixng_core::hairlink::get(&ws.work, &a, &ix.entries) {
                     Ok(t) => {
@@ -4703,6 +4732,21 @@ fn load_query_sel(
                         }
                     }
                     Err(e) => info.notes.push(format!("Strand hair: {e}")),
+                }
+                // the character's other hair styles (its own placeholders
+                // that have grooms placed), to tick instead
+                if let Ok(t) = sixng_core::hairlink::get(&ws.work, &a, &ix.entries) {
+                    let mut owners: Vec<String> = vec![format!("{}_", look.model)];
+                    owners.extend(info.strands.iter().filter_map(|s| sixng_core::outfit::outfit_prefix(&s.1)).map(|p| format!("{p}_")));
+                    let mut extra: Vec<&sixng_core::hairlink::Link> = t.links.values().flatten().filter(|l| !l.grooms.is_empty() && owners.iter().any(|o| l.placeholder.starts_with(o.as_str())) && !info.hair.iter().any(|h| h.placeholder == l.placeholder)).collect();
+                    extra.sort_by(|x, y| x.placeholder.cmp(&y.placeholder).then(y.confidence.total_cmp(&x.confidence)));
+                    extra.dedup_by(|x, y| x.placeholder == y.placeholder);
+                    for l in extra {
+                        let slot = sixng_core::pedlook::slot_of(&l.placeholder);
+                        if slot == "hair" || slot == "beard" {
+                            info.hair.push(HairPick { slot: format!("other {slot}"), placeholder: l.placeholder.clone(), confidence: l.confidence, grooms: t.uncontested(l), off_head: 0, shown: false, colour: None });
+                        }
+                    }
                 }
                 let o = &look.outfits[k];
                 info.body_shape = o.body_shape.clone();
@@ -4753,7 +4797,7 @@ fn load_query_sel(
                         h.off_head = all - h.grooms.len();
                         // body hair is fine fuzz in the game; drawn at hair
                         // width it reads as fur, so it is offered but starts off
-                        h.shown = h.slot != "body hair" && !h.grooms.is_empty() && (h.confidence >= 0.5 || (h.confidence >= 0.2 && h.off_head == 0));
+                        h.shown = h.slot != "body hair" && !h.slot.starts_with("other ") && !h.grooms.is_empty() && (h.confidence >= 0.5 || (h.confidence >= 0.2 && h.off_head == 0));
                     }
                 }
             }
@@ -6020,6 +6064,8 @@ fn export_load_shaped(
                 // and weapon parts from before their stand-in surface
                 || j.contains("e68a4a98") && !j.contains("\"gunmetal\"")
         });
+    // Cached ped clothing from before the fabric shade came from the packed map.
+    let stale_cloth = std::fs::read_to_string(dir.join("model.json")).is_ok_and(|j| j.contains("739e3d0d") && !j.contains("shade_source"));
     // Cached animal parts from before part skins (eyes, tint-mask coats).
     let stale_animal = e.name.as_deref().is_some_and(|n| sixng_core::partskin::animal_root(n).is_some())
         && std::fs::read_to_string(dir.join("model.json")).is_ok_and(|j| !j.contains("\"part_skin\""));
@@ -6028,7 +6074,7 @@ fn export_load_shaped(
         png: true,
         dds: false,
         raw: false,
-        force: head || shaped || !skins.is_empty() || stale_tint || stale_vehicle || stale_animal,
+        force: head || shaped || !skins.is_empty() || stale_tint || stale_vehicle || stale_animal || stale_cloth,
         skip_embedded_textures: false,
         body_shape,
         head_skin: HEAD_SKIN.load(std::sync::atomic::Ordering::Relaxed),

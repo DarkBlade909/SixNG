@@ -435,6 +435,21 @@ again**).
   - **Body skin tone.** No painted body texture is stored (the game builds
     skin at run time), so the body takes the colour of the face texture at
     the neck.
+  - **Fabric shading.** The colour is shaded by the green channel of the
+    garment's own packed map (`speculartex`: seams and folds, mid grey on
+    plain cloth). From the clothing pixel shader (`ped_standard_muv`, read
+    by the shader research): `speculartex` G is overlaid on the base
+    colour and B is added as linear light, both neutral at 0.5, and R
+    masks a second colour set; `speculartex2` (the small map every
+    garment also binds) never enters the colour: its G modulates gloss
+    and its R is the amount of a wear overlay. Used as the shade (as
+    before 2026-11-24) its G mottled every garment. The viewer applies G
+    only, as a multiply about mid grey: the shader's pivots, powers and
+    strengths are per-material numbers that were not found, and B is left
+    out. In the game the base colour is a three-stop gradient over a fine
+    tiling fabric texture named only in a run-time parameter block, with
+    up to eight sub-materials picked by `materialid` or a per-vertex id;
+    the viewer shows one flat colour per garment instead.
   - **Clothing colours.** An item's stored colour is used when it has one;
     else row tint 0 of its tint palette (for `ped_tint_generic_clean`
     only when the row is the colour the item's colour tag names, because
@@ -479,7 +494,15 @@ again**).
   Colour: row tint 0 of `ped_tint_hair` for the items that name that
   palette (a few hundred, mostly named characters); the others leave the
   colour to the game, so the viewer starts dark and has a colour picker.
-  Hats do not flatten the hair.
+  The panel also shows the colours of the game's hair palette as
+  swatches to click (`--hair-colour r,g,b`), and lists the character's
+  other hair styles (its own placeholders that have grooms placed) to
+  tick (`--hair-style TEXT`). `player_story000_00`'s default ponytails
+  have no groom files in any archive of the install (packs, the story
+  packs and the other packs were scanned), so that character starts
+  without hair; four other styles of hers are offered, at low confidence
+  (which of her styles a piece belongs to is not settled). Hats do not
+  flatten the hair.
 - **Pose** (Character panel; `--pose rest|down|walk|sit|wave` for
   screenshots): every part of a character is bound to the shared ped
   skeleton, and the panel turns its main bones: arms (raise, swing),
